@@ -1,6 +1,6 @@
 ---
 title: "Did You Know: Wox Can Browse Websites with Query Hotkeys"
-description: Use Query Hotkeys and the WebView plugin to open compact web panels for sites like X and Instagram.
+description: Use Query Hotkeys, Tray Queries, and the WebView plugin to open compact web panels for sites like X and Instagram.
 date: 2026-05-16
 ---
 
@@ -47,6 +47,23 @@ Use the same pattern for Instagram:
 You can also edit the WebView plugin settings to add your own site keyword and URL. After that, bind another Query Hotkey to `webview <keyword>`.
 
 ![Wox WebView action to open the page in a browser](/images/did-you-know-wox-webview-open-browser.png)
+
+Query Hotkeys are best when you want a keyboard shortcut. Tray Queries are useful when you want a persistent menu bar or system tray entry for the same quick panel.
+
+In **Settings -> General -> Tray Queries**, add a tray query that runs the same WebView query:
+
+| Tray Query field | Example value |
+| --- | --- |
+| Icon | Any icon that reminds you of the site |
+| Query | `webview x` |
+| Hide Query Box | Enabled |
+| Hide Toolbar | Enabled |
+| Width | A compact width, such as `420` |
+| Max Result Count | `5` is enough |
+
+After that, clicking the tray or menu bar icon opens Wox near the system tray and runs `webview x` directly. It is the same WebView preview, but the entry point is mouse-friendly instead of keyboard-first.
+
+![Wox Tray Query opening a WebView panel](/images/did-you-know-wox-webview-tray-query.png)
 
 This does not replace a browser. It is better for quick checks: timelines, small dashboards, docs, status pages, or any site you want to glance at without changing your current workspace. When you do need the normal browser, use the WebView result action **Open in Browser**.
 

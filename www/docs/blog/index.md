@@ -9,5 +9,6 @@ This section records engineering notes, tradeoffs, and implementation stories fr
 
 ## Posts
 
+- [Did You Know: Wox Can Bring Back a Launchpad-Style App Grid](./did-you-know-wox-app-launchpad.md) - 2026-05-16
 - [Did You Know: Wox Can Translate Selected Text Silently](./did-you-know-ai-command-silent-translation-query-hotkey.md) - 2026-05-16
 - [Did You Know: Wox Can Browse Websites with Query Hotkeys](./did-you-know-wox-query-hotkey-webview.md) - 2026-05-16
