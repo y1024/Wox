@@ -48,45 +48,75 @@ const (
 	maxCachedQueriesPerSession   = 32
 )
 
-func serializeContextData(contextData map[string]string) string {
-	if len(contextData) == 0 {
-		return ""
-	}
-	data, err := json.Marshal(contextData)
-	if err != nil {
-		return ""
-	}
-	return string(data)
-}
-
-func appendDevScoreTail(ctx context.Context, tails []QueryResultTail, score int64) []QueryResultTail {
-	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
-	if !util.IsDev() || !woxSetting.ShowScoreTail.Get() {
-		return tails
-	}
-
-	for _, tail := range tails {
-		if tail.ContextData[scoreTailContextDataKey] == "true" {
-			return tails
-		}
-	}
-
-	return append(tails, QueryResultTail{
-		Type:         QueryResultTailTypeText,
-		Text:         fmt.Sprintf("score:%d", score),
-		ContextData:  common.ContextData{scoreTailContextDataKey: "true"},
-		IsSystemTail: true,
-	})
-}
-
 type debounceTimer struct {
 	timer  *time.Timer
 	onStop func()
 }
 
+// queryPluginJob is the scheduler's normalized decision for one plugin.
+// Keeping the debounce and fallback flags together makes the lifecycle rule
+// explicit: debounced jobs still affect done, but they do not block fallback.
+type queryPluginJob struct {
+	// pluginInstance is the runnable plugin selected by the scheduler.
+	pluginInstance *Instance
+	// blocksFallback decides whether this job must finish before fallback can be shown.
+	blocksFallback bool
+	// debounced means the job starts from a debounce timer instead of immediately.
+	debounced bool
+	// intervalMs is only used for debounced jobs and stores the timer delay.
+	intervalMs int
+}
+
+// pluginQueryInput is the prepared input for one plugin query execution.
+// It keeps metadata-derived UI state, the filtered plugin query, and optional
+// requirement-blocking response together so queryForPlugin can read as stages.
+type pluginQueryInput struct {
+	// query is the plugin-facing query after env filtering.
+	query Query
+	// metadataLayout is the layout derived from plugin metadata before Plugin.Query runs.
+	metadataLayout QueryLayout
+	// queryContext is the backend-owned query classification returned to Flutter.
+	queryContext QueryContext
+	// blocked means query requirements produced a settings row instead of calling Plugin.Query.
+	blocked bool
+	// blockedResponse is returned directly when requirements prevent Plugin.Query.
+	blockedResponse QueryResponse
+}
+
+// queryExecution owns the per-query plugin scheduling state for Manager.Query.
+// Manager.Query keeps the public channel contract, while this type keeps the
+// scheduling counters, watchdog, debounce replacement, and plugin goroutines in
+// one readable lifecycle.
+type queryExecution struct {
+	// ctx carries query trace/session metadata through scheduling and plugin goroutines.
+	ctx context.Context
+	// manager owns plugin instances, debounce timers, and query cache helpers.
+	manager *Manager
+	// query is the parsed backend query shared by all scheduled plugin jobs.
+	query Query
+	// resultsChan receives normalized plugin responses in the public Manager.Query contract.
+	resultsChan chan QueryResponseUI
+	// tracker emits fallback-ready and done lifecycle signals for this query.
+	tracker *queryTracker
+	// scheduleStart is the scheduler-only timing boundary used by watchdog logs.
+	scheduleStart int64
+	// totalPlugins is the number of instances scanned by this execution.
+	totalPlugins int
+	// checkedPlugins counts instances whose eligibility has been evaluated.
+	checkedPlugins atomic.Int32
+	// scheduledPlugins counts instances accepted for immediate or debounced execution.
+	scheduledPlugins atomic.Int32
+	// scheduleComplete stops the watchdog from reporting after scheduling returns.
+	scheduleComplete atomic.Bool
+	// lastCheckedPlugin records the latest eligibility boundary for scheduler diagnostics.
+	lastCheckedPlugin atomic.Value
+	// scheduleWatchdog warns if plugin eligibility scanning stalls before channels return.
+	scheduleWatchdog *time.Timer
+}
+
 // queryTracker splits query completion into two phases:
-// 1. fallbackReady: all plugins that are allowed to block fallback have finished.
-// 2. done: every plugin has finished, including debounced plugins that may return later.
+// 1. fallbackReady: all fallback-blocking jobs have finished.
+// 2. done: all jobs have finished, including debounced jobs that may return later.
 //
 // Debounced plugins are counted only in remaining. This lets the UI show fallback
 // once the immediate plugins are done, while still keeping the query open for late
@@ -1005,64 +1035,100 @@ func (m *Manager) mergeQueryLayouts(metadataLayout QueryLayout, responseLayout Q
 }
 
 func (m *Manager) queryForPlugin(ctx context.Context, pluginInstance *Instance, query Query) (response QueryResponse) {
-	metadataLayout := QueryLayout{}
-	queryContext := BuildQueryContext(query, pluginInstance)
+	input := pluginQueryInput{
+		query:        query,
+		queryContext: BuildQueryContext(query, pluginInstance),
+	}
 	defer util.GoRecover(ctx, fmt.Sprintf("<%s> query panic", pluginInstance.GetName(ctx)), func(err error) {
-		// if plugin query panic, return error result
-		failedResult := m.GetResultForFailedQuery(ctx, pluginInstance.Metadata, query, err)
-		response.Results = []QueryResult{
-			m.PolishResult(ctx, pluginInstance, query, failedResult),
-		}
-		response.Layout = metadataLayout
-		response.Context = queryContext
+		response = m.buildFailedPluginQueryResponse(ctx, pluginInstance, input.query, input.metadataLayout, input.queryContext, err)
 	})
 
-	metadataLayout = m.buildMetadataBackedQueryLayout(ctx, pluginInstance, query)
-
-	// if plugin query requirement not met, return requirement result without calling plugin.Query
-	if requirementResult, blocked := m.buildQueryRequirementSettingsResult(ctx, pluginInstance, query); blocked {
-		return QueryResponse{
-			Results: []QueryResult{m.PolishResult(ctx, pluginInstance, query, requirementResult)},
-			Layout:  metadataLayout,
-			Context: queryContext,
-		}
+	input = m.buildPluginQueryInput(ctx, pluginInstance, query)
+	if input.blocked {
+		return input.blockedResponse
 	}
 
+	response, pluginQueryCost, recovered := m.executePluginQuery(ctx, pluginInstance, input.query, input.metadataLayout, input.queryContext)
+	if recovered {
+		return response
+	}
+
+	return m.finalizePluginQueryResponse(ctx, pluginInstance, input.query, response, input.metadataLayout, input.queryContext, pluginQueryCost)
+}
+
+func (m *Manager) buildPluginQueryInput(ctx context.Context, pluginInstance *Instance, query Query) pluginQueryInput {
+	input := pluginQueryInput{
+		query:          query,
+		metadataLayout: m.buildMetadataBackedQueryLayout(ctx, pluginInstance, query),
+		queryContext:   BuildQueryContext(query, pluginInstance),
+	}
+
+	// Query requirements are checked before calling Plugin.Query so plugins do not
+	// need to duplicate settings-gate UI rows in every implementation.
+	if requirementResult, blocked := m.buildQueryRequirementSettingsResult(ctx, pluginInstance, query); blocked {
+		input.blocked = true
+		input.blockedResponse = QueryResponse{
+			Results: []QueryResult{m.PolishResult(ctx, pluginInstance, query, requirementResult)},
+			Layout:  input.metadataLayout,
+			Context: input.queryContext,
+		}
+		return input
+	}
+
+	input.query = m.buildPluginQueryEnv(ctx, pluginInstance, query)
+	return input
+}
+
+func (m *Manager) buildPluginQueryEnv(ctx context.Context, pluginInstance *Instance, query Query) Query {
+	// Query env is intentionally opt-in per plugin because active-window and
+	// browser context can be expensive or sensitive. Keep only the fields the
+	// plugin declared so the SDK contract stays narrow.
+	currentEnv := query.Env
+	query.Env = QueryEnv{}
+	if !pluginInstance.Metadata.IsSupportFeature(MetadataFeatureQueryEnv) {
+		return query
+	}
+
+	queryEnvParams, err := pluginInstance.Metadata.GetFeatureParamsForQueryEnv()
+	if err != nil {
+		logger.Error(ctx, fmt.Sprintf("<%s> invalid query env config: %s", pluginInstance.GetName(ctx), err))
+		return query
+	}
+
+	if queryEnvParams.RequireActiveWindowName {
+		query.Env.ActiveWindowTitle = currentEnv.ActiveWindowTitle
+	}
+	if queryEnvParams.RequireActiveWindowPid {
+		query.Env.ActiveWindowPid = currentEnv.ActiveWindowPid
+	}
+	if queryEnvParams.RequireActiveWindowIcon {
+		query.Env.ActiveWindowIcon = currentEnv.ActiveWindowIcon
+	}
+	if queryEnvParams.RequireActiveWindowIsOpenSaveDialog {
+		query.Env.ActiveWindowIsOpenSaveDialog = currentEnv.ActiveWindowIsOpenSaveDialog
+	}
+	if queryEnvParams.RequireActiveBrowserUrl {
+		query.Env.ActiveBrowserUrl = currentEnv.ActiveBrowserUrl
+	}
+
+	return query
+}
+
+func (m *Manager) executePluginQuery(ctx context.Context, pluginInstance *Instance, query Query, metadataLayout QueryLayout, queryContext QueryContext) (response QueryResponse, pluginQueryCost int64, recovered bool) {
 	logger.Info(ctx, fmt.Sprintf("<%s> start query: %s", pluginInstance.GetName(ctx), query.RawQuery))
 	start := util.GetSystemTimestamp()
-
-	// set query env base on plugin's feature
-	currentEnv := query.Env
-	newEnv := QueryEnv{}
-	if pluginInstance.Metadata.IsSupportFeature(MetadataFeatureQueryEnv) {
-		queryEnvParams, err := pluginInstance.Metadata.GetFeatureParamsForQueryEnv()
-		if err != nil {
-			logger.Error(ctx, fmt.Sprintf("<%s> invalid query env config: %s", pluginInstance.GetName(ctx), err))
-		} else {
-			if queryEnvParams.RequireActiveWindowName {
-				newEnv.ActiveWindowTitle = currentEnv.ActiveWindowTitle
-			}
-			if queryEnvParams.RequireActiveWindowPid {
-				newEnv.ActiveWindowPid = currentEnv.ActiveWindowPid
-			}
-			if queryEnvParams.RequireActiveWindowIcon {
-				newEnv.ActiveWindowIcon = currentEnv.ActiveWindowIcon
-			}
-			if queryEnvParams.RequireActiveWindowIsOpenSaveDialog {
-				newEnv.ActiveWindowIsOpenSaveDialog = currentEnv.ActiveWindowIsOpenSaveDialog
-			}
-			if queryEnvParams.RequireActiveBrowserUrl {
-				newEnv.ActiveBrowserUrl = currentEnv.ActiveBrowserUrl
-			}
-		}
-	}
-	query.Env = newEnv
-
+	defer util.GoRecover(ctx, fmt.Sprintf("<%s> query panic", pluginInstance.GetName(ctx)), func(err error) {
+		recovered = true
+		response = m.buildFailedPluginQueryResponse(ctx, pluginInstance, query, metadataLayout, queryContext, err)
+	})
 	response = pluginInstance.Plugin.Query(ctx, query)
+	pluginQueryCost = util.GetSystemTimestamp() - start
+	return response, pluginQueryCost, false
+}
+
+func (m *Manager) finalizePluginQueryResponse(ctx context.Context, pluginInstance *Instance, query Query, response QueryResponse, metadataLayout QueryLayout, queryContext QueryContext, pluginQueryCost int64) QueryResponse {
 	response.Layout = m.mergeQueryLayouts(metadataLayout, response.Layout)
 	response.Context = queryContext
-	pluginQueryCost := util.GetSystemTimestamp() - start
-
 	// Keep the plugin latency EWMA scoped to Plugin.Query itself.
 	// Manager-side polishing is shared overhead layered on top of plugin execution.
 	m.updatePluginQueryLatency(pluginInstance.Metadata.Id, float64(pluginQueryCost))
@@ -1086,6 +1152,20 @@ func (m *Manager) queryForPlugin(ctx context.Context, pluginInstance *Instance, 
 	}
 
 	return response
+}
+
+func (m *Manager) buildFailedPluginQueryResponse(ctx context.Context, pluginInstance *Instance, query Query, metadataLayout QueryLayout, queryContext QueryContext, err error) QueryResponse {
+	// Panic fallback keeps one failed plugin from breaking the whole query run.
+	// The failed row is polished like normal results so actions, icons, and cache
+	// behavior stay compatible with the existing result pipeline.
+	failedResult := m.GetResultForFailedQuery(ctx, pluginInstance.Metadata, query, err)
+	return QueryResponse{
+		Results: []QueryResult{
+			m.PolishResult(ctx, pluginInstance, query, failedResult),
+		},
+		Layout:  metadataLayout,
+		Context: queryContext,
+	}
 }
 
 func (m *Manager) GetResultForFailedQuery(ctx context.Context, pluginMetadata Metadata, query Query, err error) QueryResult {
@@ -1928,7 +2008,7 @@ func (m *Manager) PolishResult(ctx context.Context, pluginInstance *Instance, qu
 		}
 	}
 
-	result.Tails = appendDevScoreTail(ctx, result.Tails, result.Score)
+	result.Tails = m.appendDevScoreTail(ctx, result.Tails, result.Score)
 
 	// Create cache at the end
 	resultCopy := result
@@ -2106,7 +2186,7 @@ func (m *Manager) PolishUpdatableResult(ctx context.Context, pluginInstance *Ins
 			}
 		}
 
-		tails = appendDevScoreTail(ctx, tails, resultCache.Result.Score)
+		tails = m.appendDevScoreTail(ctx, tails, resultCache.Result.Score)
 
 		result.Tails = &tails
 		resultCache.Result.Tails = tails
@@ -2140,6 +2220,37 @@ func (m *Manager) PolishUpdatableResult(ctx context.Context, pluginInstance *Ins
 	}
 
 	return result
+}
+
+func (m *Manager) serializeContextData(contextData map[string]string) string {
+	if len(contextData) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(contextData)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func (m *Manager) appendDevScoreTail(ctx context.Context, tails []QueryResultTail, score int64) []QueryResultTail {
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if !util.IsDev() || !woxSetting.ShowScoreTail.Get() {
+		return tails
+	}
+
+	for _, tail := range tails {
+		if tail.ContextData[scoreTailContextDataKey] == "true" {
+			return tails
+		}
+	}
+
+	return append(tails, QueryResultTail{
+		Type:         QueryResultTailTypeText,
+		Text:         fmt.Sprintf("score:%d", score),
+		ContextData:  common.ContextData{scoreTailContextDataKey: "true"},
+		IsSystemTail: true,
+	})
 }
 
 // For external plugins (Node.js/Python), create proxy action callbacks
@@ -2210,82 +2321,155 @@ func (m *Manager) Query(ctx context.Context, query Query) (resultsChan chan Quer
 	fallbackReadyChan = make(chan bool, 1)
 	doneChan = make(chan bool, 1)
 
-	m.startSessionQueryCache(query)
-
 	tracker := newQueryTracker(fallbackReadyChan, doneChan)
-	scheduleStart := util.GetSystemTimestamp()
-	totalPlugins := len(m.instances)
-	var checkedPlugins atomic.Int32
-	var scheduledPlugins atomic.Int32
-	var scheduleComplete atomic.Bool
-	var lastCheckedPlugin atomic.Value
-	lastCheckedPlugin.Store("")
+	execution := newQueryExecution(ctx, m, query, resultsChan, tracker)
+	execution.start()
+
+	return
+}
+
+func newQueryExecution(ctx context.Context, manager *Manager, query Query, resultsChan chan QueryResponseUI, tracker *queryTracker) *queryExecution {
+	execution := &queryExecution{
+		ctx:          ctx,
+		manager:      manager,
+		query:        query,
+		resultsChan:  resultsChan,
+		tracker:      tracker,
+		totalPlugins: len(manager.instances),
+	}
+	execution.lastCheckedPlugin.Store("")
+	return execution
+}
+
+func (e *queryExecution) start() {
+	e.manager.startSessionQueryCache(e.query)
+	e.scheduleStart = util.GetSystemTimestamp()
+	e.startScheduleWatchdog()
+	defer e.stopScheduleWatchdog()
+
+	e.schedulePlugins()
+
+	// Queries with no runnable plugins should still notify both phases immediately.
+	e.tracker.notifyIfEmpty()
+	logger.Debug(e.ctx, fmt.Sprintf("query scheduler finished: query=%s checked=%d/%d scheduled=%d elapsed=%dms", e.query.String(), e.checkedPlugins.Load(), e.totalPlugins, e.scheduledPlugins.Load(), util.GetSystemTimestamp()-e.scheduleStart))
+}
+
+func (e *queryExecution) startScheduleWatchdog() {
 	// Bug diagnostics: an intermittent launcher spinner can happen before the
 	// caller receives result/done channels. Track the scheduler scan separately
 	// so the next log capture can tell whether eligibility checks got stuck on a
 	// specific plugin instead of blaming the plugin that already finished.
-	scheduleWatchdog := time.AfterFunc(250*time.Millisecond, func() {
-		if scheduleComplete.Load() {
+	e.scheduleWatchdog = time.AfterFunc(250*time.Millisecond, func() {
+		if e.scheduleComplete.Load() {
 			return
 		}
-		lastPlugin, _ := lastCheckedPlugin.Load().(string)
-		logger.Warn(ctx, fmt.Sprintf("query scheduler still scanning plugins: query=%s checked=%d/%d scheduled=%d last_plugin=%s elapsed=%dms", query.String(), checkedPlugins.Load(), totalPlugins, scheduledPlugins.Load(), lastPlugin, util.GetSystemTimestamp()-scheduleStart))
+		lastPlugin, _ := e.lastCheckedPlugin.Load().(string)
+		logger.Warn(e.ctx, fmt.Sprintf("query scheduler still scanning plugins: query=%s checked=%d/%d scheduled=%d last_plugin=%s elapsed=%dms", e.query.String(), e.checkedPlugins.Load(), e.totalPlugins, e.scheduledPlugins.Load(), lastPlugin, util.GetSystemTimestamp()-e.scheduleStart))
 	})
-	defer func() {
-		scheduleComplete.Store(true)
-		scheduleWatchdog.Stop()
-	}()
+}
 
-	for _, pluginInstance := range m.instances {
-		checkedPlugins.Add(1)
-		lastCheckedPlugin.Store(queryDiagnosticPluginLabel(pluginInstance))
-		if !m.canOperateQuery(ctx, pluginInstance, query) {
+func (e *queryExecution) stopScheduleWatchdog() {
+	e.scheduleComplete.Store(true)
+	if e.scheduleWatchdog != nil {
+		e.scheduleWatchdog.Stop()
+	}
+}
+
+func (e *queryExecution) schedulePlugins() {
+	for _, pluginInstance := range e.manager.instances {
+		job, ok := e.schedulePlugin(pluginInstance)
+		if !ok {
 			continue
 		}
-		scheduledPlugins.Add(1)
+		e.startPluginJob(job)
+	}
+}
 
-		// Debounced plugins are treated as late work: they still participate in the
-		// final query completion, but they do not delay fallback.
-		blocksFallback := !pluginInstance.Metadata.IsSupportFeature(MetadataFeatureDebounce)
-		if pluginInstance.Metadata.IsSupportFeature(MetadataFeatureDebounce) {
-			debounceParams, err := pluginInstance.Metadata.GetFeatureParamsForDebounce()
-			if err == nil {
-				tracker.start(blocksFallback)
-				logger.Debug(ctx, fmt.Sprintf("[%s] debounce query, will execute in %d ms", pluginInstance.GetName(ctx), debounceParams.IntervalMs))
-				if v, ok := m.debounceQueryTimer.Load(pluginInstance.Metadata.Id); ok {
-					if v.timer.Stop() {
-						v.onStop()
-					}
-				}
+func (e *queryExecution) schedulePlugin(pluginInstance *Instance) (queryPluginJob, bool) {
+	e.checkedPlugins.Add(1)
+	e.lastCheckedPlugin.Store(queryDiagnosticPluginLabel(pluginInstance))
+	if !e.manager.canOperateQuery(e.ctx, pluginInstance, e.query) {
+		return queryPluginJob{}, false
+	}
+	e.scheduledPlugins.Add(1)
 
-				timer := time.AfterFunc(time.Duration(debounceParams.IntervalMs)*time.Millisecond, func() {
-					m.queryParallel(ctx, pluginInstance, query, resultsChan, tracker, blocksFallback)
-				})
-				onStop := func() {
-					// A newer query replaced this debounced run before it started. Mark this
-					// plugin as finished for the current query lifecycle so counters do not hang.
-					logger.Debug(ctx, fmt.Sprintf("[%s] previous debounced query cancelled", pluginInstance.GetName(ctx)))
-					tracker.finish(blocksFallback)
-				}
-				m.debounceQueryTimer.Store(pluginInstance.Metadata.Id, &debounceTimer{
-					timer:  timer,
-					onStop: onStop,
-				})
-				continue
-			} else {
-				logger.Error(ctx, fmt.Sprintf("[%s] %s, query directlly", pluginInstance.GetName(ctx), err))
-			}
-		}
-
-		tracker.start(blocksFallback)
-		m.queryParallel(ctx, pluginInstance, query, resultsChan, tracker, blocksFallback)
+	// Debounced plugins are treated as late work: they still participate in final
+	// query completion, but they do not delay fallback. This mirrors the previous
+	// inline scheduler behavior while making the job lifecycle explicit.
+	supportsDebounce := pluginInstance.Metadata.IsSupportFeature(MetadataFeatureDebounce)
+	job := queryPluginJob{
+		pluginInstance: pluginInstance,
+		blocksFallback: !supportsDebounce,
+	}
+	if !supportsDebounce {
+		return job, true
 	}
 
-	// Queries with no runnable plugins should still notify both phases immediately.
-	tracker.notifyIfEmpty()
-	logger.Debug(ctx, fmt.Sprintf("query scheduler finished: query=%s checked=%d/%d scheduled=%d elapsed=%dms", query.String(), checkedPlugins.Load(), totalPlugins, scheduledPlugins.Load(), util.GetSystemTimestamp()-scheduleStart))
+	debounceParams, err := pluginInstance.Metadata.GetFeatureParamsForDebounce()
+	if err != nil {
+		logger.Error(e.ctx, fmt.Sprintf("[%s] %s, query directly", pluginInstance.GetName(e.ctx), err))
+		return job, true
+	}
 
-	return
+	job.debounced = true
+	job.intervalMs = debounceParams.IntervalMs
+	return job, true
+}
+
+func (e *queryExecution) startPluginJob(job queryPluginJob) {
+	e.tracker.startJob(job.blocksFallback)
+	if job.debounced {
+		e.replaceDebouncedJob(job)
+		return
+	}
+	e.runPluginJob(job)
+}
+
+func (e *queryExecution) replaceDebouncedJob(job queryPluginJob) {
+	pluginInstance := job.pluginInstance
+	logger.Debug(e.ctx, fmt.Sprintf("[%s] debounce query, will execute in %d ms", pluginInstance.GetName(e.ctx), job.intervalMs))
+	if v, ok := e.manager.debounceQueryTimer.Load(pluginInstance.Metadata.Id); ok {
+		if v.timer.Stop() {
+			v.onStop()
+		}
+	}
+
+	timer := time.AfterFunc(time.Duration(job.intervalMs)*time.Millisecond, func() {
+		e.runPluginJob(job)
+	})
+	onStop := func() {
+		// A newer query replaced this debounced run before it started. Mark this
+		// job as finished for the current query lifecycle so counters do not hang.
+		logger.Debug(e.ctx, fmt.Sprintf("[%s] previous debounced query cancelled", pluginInstance.GetName(e.ctx)))
+		e.tracker.finishJob(job.blocksFallback)
+	}
+	e.manager.debounceQueryTimer.Store(pluginInstance.Metadata.Id, &debounceTimer{
+		timer:  timer,
+		onStop: onStop,
+	})
+}
+
+func (e *queryExecution) runPluginJob(job queryPluginJob) {
+	pluginInstance := job.pluginInstance
+	util.Go(e.ctx, fmt.Sprintf("[%s] parallel query", pluginInstance.GetName(e.ctx)), func() {
+		// QueryResponse keeps result rows and query-scoped UI metadata together.
+		// Sending one normalized response through the query pipeline prevents the
+		// UI from applying refinements or layout from a different query execution.
+		queryResponse := e.manager.queryForPlugin(e.ctx, pluginInstance, e.query)
+		// Bug diagnostics: queryForPlugin logs before response conversion and
+		// tracker completion. These boundaries make it clear whether a future
+		// spinner is stuck while converting/sending results or while marking the
+		// plugin as finished for the query lifecycle.
+		queryResponseUI := queryResponse.ToUI()
+		logger.Debug(e.ctx, fmt.Sprintf("<%s> query response converted for UI, result count: %d", pluginInstance.GetName(e.ctx), len(queryResponseUI.Results)))
+		e.resultsChan <- queryResponseUI
+		logger.Debug(e.ctx, fmt.Sprintf("<%s> query response delivered to query pipeline", pluginInstance.GetName(e.ctx)))
+		e.tracker.finishJob(job.blocksFallback)
+		logger.Debug(e.ctx, fmt.Sprintf("<%s> query tracker finished, blocks fallback: %v", pluginInstance.GetName(e.ctx), job.blocksFallback))
+	}, func() {
+		logger.Warn(e.ctx, fmt.Sprintf("<%s> query goroutine recovered, force finishing tracker", pluginInstance.GetName(e.ctx)))
+		e.tracker.finishJob(job.blocksFallback)
+	})
 }
 
 func (m *Manager) QuerySilent(ctx context.Context, query Query) bool {
@@ -2398,19 +2582,19 @@ func newQueryTracker(fallbackReady chan bool, done chan bool) *queryTracker {
 	}
 }
 
-func (t *queryTracker) start(blocksFallback bool) {
+func (t *queryTracker) startJob(blocksFallback bool) {
 	t.remaining.Add(1)
 	if blocksFallback {
 		t.fallbackRemaining.Add(1)
 	}
 }
 
-func (t *queryTracker) finish(blocksFallback bool) {
-	// fallbackReady fires once the last fallback-blocking plugin completes.
+func (t *queryTracker) finishJob(blocksFallback bool) {
+	// fallbackReady fires once the last fallback-blocking job completes.
 	if blocksFallback && t.fallbackRemaining.Add(-1) == 0 {
 		t.fallbackReady <- true
 	}
-	// done fires only after every plugin completes, including debounced ones.
+	// done fires only after every job completes, including debounced ones.
 	if t.remaining.Add(-1) == 0 {
 		t.done <- true
 	}
@@ -2424,28 +2608,6 @@ func (t *queryTracker) notifyIfEmpty() {
 	if t.remaining.Load() == 0 {
 		t.done <- true
 	}
-}
-
-func (m *Manager) queryParallel(ctx context.Context, pluginInstance *Instance, query Query, results chan QueryResponseUI, tracker *queryTracker, blocksFallback bool) {
-	util.Go(ctx, fmt.Sprintf("[%s] parallel query", pluginInstance.GetName(ctx)), func() {
-		// QueryResponse keeps result rows and query-scoped UI metadata together.
-		// Sending one normalized response through the query pipeline prevents the
-		// UI from applying refinements or layout from a different query execution.
-		queryResponse := m.queryForPlugin(ctx, pluginInstance, query)
-		// Bug diagnostics: queryForPlugin logs before response conversion and
-		// tracker completion. These boundaries make it clear whether a future
-		// spinner is stuck while converting/sending results or while marking the
-		// plugin as finished for the query lifecycle.
-		queryResponseUI := queryResponse.ToUI()
-		logger.Debug(ctx, fmt.Sprintf("<%s> query response converted for UI, result count: %d", pluginInstance.GetName(ctx), len(queryResponseUI.Results)))
-		results <- queryResponseUI
-		logger.Debug(ctx, fmt.Sprintf("<%s> query response delivered to query pipeline", pluginInstance.GetName(ctx)))
-		tracker.finish(blocksFallback)
-		logger.Debug(ctx, fmt.Sprintf("<%s> query tracker finished, blocks fallback: %v", pluginInstance.GetName(ctx), blocksFallback))
-	}, func() {
-		logger.Warn(ctx, fmt.Sprintf("<%s> query goroutine recovered, force finishing tracker", pluginInstance.GetName(ctx)))
-		tracker.finish(blocksFallback)
-	})
 }
 
 func queryDiagnosticPluginLabel(pluginInstance *Instance) string {
@@ -3032,7 +3194,7 @@ func (m *Manager) QueryMRU(ctx context.Context, sessionId string, queryId string
 			util.GetLogger().Debug(ctx, fmt.Sprintf("mru item restored: %s", item.Title))
 
 			// Build a stable dedupe key using restored values, which are language-independent for Go plugins
-			key := fmt.Sprintf("%s|%s|%s|%s", item.PluginID, restored.Title, restored.SubTitle, serializeContextData(item.ContextData))
+			key := fmt.Sprintf("%s|%s|%s|%s", item.PluginID, restored.Title, restored.SubTitle, m.serializeContextData(item.ContextData))
 			if seen[key] {
 				util.GetLogger().Debug(ctx, fmt.Sprintf("duplicate mru item, skip restore mru item: %s", item.Title))
 				continue
