@@ -681,11 +681,13 @@ func handleWebsocketQuery(ctx context.Context, request WebsocketMsg) {
 		if !isFinal && len(results) == 0 {
 			return
 		}
-		if !plugin.GetPluginManager().IsCurrentQuery(sessionId, queryId) {
-			return
-		}
 
 		logger.Info(ctx, fmt.Sprintf("query %s: %s, result flushed (reason: %s, isFinal: %v), current: %d, total results: %d", query.Type, query.String(), reason, isFinal, len(results), totalResultCount))
+		// Bug fix: core query pipelines are concurrent, so backend "current query"
+		// state can move while an older or newer pipeline is still flushing. Send
+		// the queryId-specific snapshot and let Flutter decide whether it is still
+		// the visible query; otherwise the current query can miss its final response
+		// and keep the loading indicator alive.
 		snapshot := plugin.GetPluginManager().BuildQueryResultsSnapshot(sessionId, queryId)
 		if len(snapshot) > 0 {
 			resultFlushBatch++
@@ -734,18 +736,14 @@ func handleWebsocketQuery(ctx context.Context, request WebsocketMsg) {
 		totalResultCount += len(response.Results)
 		resultDebouncer.Add(ctx, response.Results)
 	}
-	drainPendingResults := func() bool {
+	drainPendingResults := func() {
 		// Drain queued results first so fallback does not race ahead of already-finished plugins.
 		for {
 			select {
 			case response := <-resultChan:
-				if !plugin.GetPluginManager().IsCurrentQuery(sessionId, queryId) {
-					resultDebouncer.Done(ctx)
-					return false
-				}
 				addResponse(response)
 			default:
-				return true
+				return
 			}
 		}
 	}
@@ -770,31 +768,15 @@ func handleWebsocketQuery(ctx context.Context, request WebsocketMsg) {
 	for {
 		select {
 		case response := <-resultChan:
-			if !plugin.GetPluginManager().IsCurrentQuery(sessionId, queryId) {
-				resultDebouncer.Done(ctx)
-				return
-			}
 			addResponse(response)
 		case <-fallbackReadyChan:
-			if !plugin.GetPluginManager().IsCurrentQuery(sessionId, queryId) {
-				resultDebouncer.Done(ctx)
-				return
-			}
 			// Consume any already-produced results before checking whether fallback is needed.
-			if !drainPendingResults() {
-				return
-			}
+			drainPendingResults()
 			showFallbackResults()
 		case <-doneChan:
-			if !plugin.GetPluginManager().IsCurrentQuery(sessionId, queryId) {
-				resultDebouncer.Done(ctx)
-				return
-			}
 			// Run the same fallback check at final completion so queries without any
 			// fallback-blocking plugins still get a fallback result when appropriate.
-			if !drainPendingResults() {
-				return
-			}
+			drainPendingResults()
 			showFallbackResults()
 			logger.Info(ctx, fmt.Sprintf("query done, total results: %d, cost %d ms", totalResultCount, util.GetSystemTimestamp()-startTimestamp))
 			resultDebouncer.Done(ctx)

@@ -45,6 +45,7 @@ const (
 	favoriteTailContextDataValue = "true"
 	scoreTailContextDataKey      = "system:score"
 	previewDataMaxSize           = 1024
+	maxCachedQueriesPerSession   = 32
 )
 
 func serializeContextData(contextData map[string]string) string {
@@ -98,14 +99,16 @@ type queryTracker struct {
 }
 
 type QueryResultSet struct {
-	Query   Query
-	Results *util.HashMap[string, *QueryResultCache]
+	Query     Query
+	StartedAt int64
+	Results   *util.HashMap[string, *QueryResultCache]
 }
 
 func newQueryResultSet(query Query) *QueryResultSet {
 	set := &QueryResultSet{
-		Query:   query,
-		Results: util.NewHashMap[string, *QueryResultCache](),
+		Query:     query,
+		StartedAt: util.GetSystemTimestamp(),
+		Results:   util.NewHashMap[string, *QueryResultCache](),
 	}
 	return set
 }
@@ -115,9 +118,10 @@ type Manager struct {
 	systemPluginsWg sync.WaitGroup // waits for all system plugins to finish loading
 	ui              common.UI
 
-	// ui session based query result cache. [SessionId] => QueryResultSet
-	// one ui session can only have one active query at a time
-	sessionQueryResultCache *util.HashMap[string, *QueryResultSet]
+	// Query pipelines are concurrent in core even though Flutter displays only
+	// one active query. Key by session and query id so a late pipeline cannot
+	// overwrite the result snapshot needed by another query's final response.
+	sessionQueryResultCache *util.HashMap[string, *util.HashMap[string, *QueryResultSet]]
 
 	debounceQueryTimer *util.HashMap[string, *debounceTimer]
 	aiProviders        *util.HashMap[string, ai.Provider]
@@ -148,7 +152,7 @@ const (
 func GetPluginManager() *Manager {
 	managerOnce.Do(func() {
 		managerInstance = &Manager{
-			sessionQueryResultCache: util.NewHashMap[string, *QueryResultSet](),
+			sessionQueryResultCache: util.NewHashMap[string, *util.HashMap[string, *QueryResultSet]](),
 			debounceQueryTimer:      util.NewHashMap[string, *debounceTimer](),
 			aiProviders:             util.NewHashMap[string, ai.Provider](),
 			scriptReloadTimers:      util.NewHashMap[string, *time.Timer](),
@@ -1339,25 +1343,68 @@ func (m *Manager) calculateResultScore(ctx context.Context, pluginId, title, sub
 }
 
 func (m *Manager) startSessionQueryCache(query Query) {
-	m.sessionQueryResultCache.Store(query.SessionId, newQueryResultSet(query))
-}
-
-func (m *Manager) getQueryResultSet(sessionId string) (*QueryResultSet, bool) {
-	return m.sessionQueryResultCache.Load(sessionId)
-}
-
-func (m *Manager) getQueryResultSetForQuery(query Query) (*QueryResultSet, bool) {
 	if query.Id == "" {
+		return
+	}
+
+	sessionQueries, _ := m.sessionQueryResultCache.LoadOrStore(query.SessionId, util.NewHashMap[string, *QueryResultSet]())
+
+	// Bug fix: a UI session can have multiple backend query pipelines in flight
+	// because WebSocket requests and plugin responses are handled concurrently.
+	// Store every query under its own query id so a late old query cannot erase
+	// the result cache required to send the newer query's final response.
+	sessionQueries.Store(query.Id, newQueryResultSet(query))
+	m.pruneSessionQueryCache(sessionQueries, query.Id)
+}
+
+// pruneSessionQueryCache ensures the number of cached queries for a session does not exceed the defined maximum.·
+func (m *Manager) pruneSessionQueryCache(sessionQueries *util.HashMap[string, *QueryResultSet], keepQueryId string) {
+	if sessionQueries.Len() <= maxCachedQueriesPerSession {
+		return
+	}
+
+	type cachedQueryEntry struct {
+		queryId   string
+		startedAt int64
+	}
+	var entries []cachedQueryEntry
+	sessionQueries.Range(func(queryId string, set *QueryResultSet) bool {
+		if queryId != keepQueryId {
+			entries = append(entries, cachedQueryEntry{queryId: queryId, startedAt: set.StartedAt})
+		}
+		return true
+	})
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].startedAt < entries[j].startedAt
+	})
+
+	// Query caches are now keyed by query id, so without a small cap every typed
+	// character would leave a completed result set behind. Keep the newest sets
+	// plus the query that was just started; old non-current responses are still
+	// safe to drop because Flutter ignores them by query id.
+	for sessionQueries.Len() > maxCachedQueriesPerSession && len(entries) > 0 {
+		if entries[0].queryId == keepQueryId {
+			entries = entries[1:]
+			continue
+		}
+		sessionQueries.Delete(entries[0].queryId)
+		entries = entries[1:]
+	}
+}
+
+func (m *Manager) getQueryResultSet(sessionId string, queryId string) (*QueryResultSet, bool) {
+	if queryId == "" {
 		return nil, false
 	}
-	set, ok := m.sessionQueryResultCache.Load(query.SessionId)
+	sessionQueries, ok := m.sessionQueryResultCache.Load(sessionId)
 	if !ok {
 		return nil, false
 	}
-	if set.Query.Id != query.Id {
-		return nil, false
-	}
-	return set, true
+	return sessionQueries.Load(queryId)
+}
+
+func (m *Manager) getQueryResultSetForQuery(query Query) (*QueryResultSet, bool) {
+	return m.getQueryResultSet(query.SessionId, query.Id)
 }
 
 func (m *Manager) storeQueryResult(ctx context.Context, pluginInstance *Instance, query Query, resultOriginal QueryResult) {
@@ -1388,8 +1435,8 @@ func (m *Manager) RecordQueryResultQueryElapsed(sessionId string, queryId string
 		return
 	}
 
-	set, found := m.sessionQueryResultCache.Load(sessionId)
-	if !found || set.Query.Id != queryId {
+	set, found := m.getQueryResultSet(sessionId, queryId)
+	if !found {
 		return
 	}
 
@@ -1416,8 +1463,8 @@ func (m *Manager) RecordQueryResultFlushBatch(sessionId string, queryId string, 
 		return
 	}
 
-	set, found := m.sessionQueryResultCache.Load(sessionId)
-	if !found || set.Query.Id != queryId {
+	set, found := m.getQueryResultSet(sessionId, queryId)
+	if !found {
 		return
 	}
 
@@ -1454,18 +1501,35 @@ func (m *Manager) findResultCacheInSession(sessionId string, queryId string, res
 	if resultId == "" {
 		return nil, false
 	}
-	set, found := m.sessionQueryResultCache.Load(sessionId)
+	if queryId != "" {
+		set, found := m.getQueryResultSet(sessionId, queryId)
+		if !found {
+			return nil, false
+		}
+		resultCache, found := set.Results.Load(resultId)
+		if !found {
+			return nil, false
+		}
+		return resultCache, true
+	}
+
+	sessionQueries, found := m.sessionQueryResultCache.Load(sessionId)
 	if !found {
 		return nil, false
 	}
-	if queryId != "" && set.Query.Id != queryId {
+	var foundCache *QueryResultCache
+	sessionQueries.Range(func(_ string, set *QueryResultSet) bool {
+		resultCache, found := set.Results.Load(resultId)
+		if !found {
+			return true
+		}
+		foundCache = resultCache
+		return false
+	})
+	if foundCache == nil {
 		return nil, false
 	}
-	resultCache, found := set.Results.Load(resultId)
-	if !found {
-		return nil, false
-	}
-	return resultCache, true
+	return foundCache, true
 }
 
 func (m *Manager) findResultCacheById(resultId string) (*QueryResultCache, bool) {
@@ -1474,12 +1538,18 @@ func (m *Manager) findResultCacheById(resultId string) (*QueryResultCache, bool)
 	}
 
 	var foundCache *QueryResultCache
-	m.sessionQueryResultCache.Range(func(_ string, set *QueryResultSet) bool {
-		resultCache, found := set.Results.Load(resultId)
-		if !found {
+	m.sessionQueryResultCache.Range(func(_ string, sessionQueries *util.HashMap[string, *QueryResultSet]) bool {
+		sessionQueries.Range(func(_ string, set *QueryResultSet) bool {
+			resultCache, found := set.Results.Load(resultId)
+			if !found {
+				return true
+			}
+			foundCache = resultCache
+			return false
+		})
+		if foundCache == nil {
 			return true
 		}
-		foundCache = resultCache
 		return false
 	})
 
@@ -1506,9 +1576,9 @@ func (m *Manager) GetSessionIdByQueryId(queryId string) string {
 		return ""
 	}
 	var sessionId string
-	m.sessionQueryResultCache.Range(func(_ string, set *QueryResultSet) bool {
-		if set.Query.Id == queryId {
-			sessionId = set.Query.SessionId
+	m.sessionQueryResultCache.Range(func(candidateSessionId string, sessionQueries *util.HashMap[string, *QueryResultSet]) bool {
+		if _, ok := sessionQueries.Load(queryId); ok {
+			sessionId = candidateSessionId
 			return false
 		}
 		return true
@@ -1530,17 +1600,6 @@ func (m *Manager) GetQueryInfoByResultId(resultId string) (string, string) {
 		return "", ""
 	}
 	return resultCache.Query.SessionId, resultCache.Query.Id
-}
-
-func (m *Manager) IsCurrentQuery(sessionId string, queryId string) bool {
-	if queryId == "" {
-		return false
-	}
-	set, found := m.sessionQueryResultCache.Load(sessionId)
-	if !found {
-		return false
-	}
-	return set.Query.Id == queryId
 }
 
 func (m *Manager) buildResultUI(resultCache *QueryResultCache, queryId string) QueryResultUI {
@@ -1599,8 +1658,11 @@ func (m *Manager) BuildQueryResultsSnapshot(sessionId string, queryId string) []
 	if queryId == "" {
 		return []QueryResultUI{}
 	}
-	set, found := m.sessionQueryResultCache.Load(sessionId)
-	if !found || set.Query.Id != queryId {
+	// Bug fix: snapshot lookup must use the query id, not the session's latest
+	// query. Multiple backend query pipelines can finish out of order, while
+	// Flutter filters visibility by QueryId after the response is delivered.
+	set, found := m.getQueryResultSet(sessionId, queryId)
+	if !found {
 		return []QueryResultUI{}
 	}
 

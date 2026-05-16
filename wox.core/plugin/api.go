@@ -530,11 +530,10 @@ func (a *APIImpl) PushResults(ctx context.Context, query Query, results []QueryR
 	if util.GetContextSessionId(ctx) == "" {
 		ctx = util.WithQueryIdContext(util.WithSessionContext(ctx, query.SessionId), query.Id)
 	}
-	if !GetPluginManager().IsCurrentQuery(query.SessionId, query.Id) {
-		a.Log(ctx, LogLevelWarning, "PushResults ignored: query is not active")
-		return false
-	}
 
+	// Bug fix: core no longer owns "current query" state because backend query
+	// pipelines are concurrent. Push by query id and let Flutter accept or reject
+	// the payload against the visible query, matching normal Query responses.
 	for i := range results {
 		results[i] = GetPluginManager().PolishResult(ctx, a.pluginInstance, query, results[i])
 	}
