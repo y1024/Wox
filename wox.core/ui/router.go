@@ -1401,8 +1401,9 @@ func handleTestTriggerOpenSetting(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type request struct {
-		Path  string
-		Param string
+		Path   string
+		Param  string
+		Source string
 	}
 
 	var req request
@@ -1413,8 +1414,9 @@ func handleTestTriggerOpenSetting(w http.ResponseWriter, r *http.Request) {
 
 	ctx := getTraceContext(r)
 	GetUIManager().GetUI(ctx).OpenSettingWindow(ctx, common.SettingWindowContext{
-		Path:  strings.TrimSpace(req.Path),
-		Param: strings.TrimSpace(req.Param),
+		Path:   strings.TrimSpace(req.Path),
+		Param:  strings.TrimSpace(req.Param),
+		Source: common.SettingWindowSource(strings.TrimSpace(req.Source)),
 	})
 	writeSuccessResponse(w, "")
 }

@@ -296,8 +296,8 @@ Future<void> triggerTestQueryHotkey(WidgetTester tester, String query, {bool isS
   await waitForWindowVisibility(tester, true);
 }
 
-Future<void> triggerTestOpenSetting(WidgetTester tester, {String path = '', String param = ''}) async {
-  await WoxHttpUtil.instance.postData<String>(const UuidV4().generate(), '/test/trigger/open_setting', {'Path': path, 'Param': param});
+Future<void> triggerTestOpenSetting(WidgetTester tester, {String path = '', String param = '', String source = ''}) async {
+  await WoxHttpUtil.instance.postData<String>(const UuidV4().generate(), '/test/trigger/open_setting', {'Path': path, 'Param': param, 'Source': source});
   await tester.pump(const Duration(milliseconds: 500));
 }
 

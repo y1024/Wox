@@ -28,9 +28,24 @@ type PlainQuery struct {
 
 var DefaultSettingWindowContext = SettingWindowContext{Path: "/"}
 
+type SettingWindowSource string
+
+const (
+	// SettingWindowSourceDefault keeps the setting page tied to the launcher flow.
+	// It is the safe default for query-result actions and plugin-initiated opens.
+	SettingWindowSourceDefault SettingWindowSource = "default"
+	// SettingWindowSourceTray marks settings opened from the tray/menu-bar menu,
+	// where Escape should close the management window instead of restoring query UI.
+	SettingWindowSourceTray SettingWindowSource = "tray"
+)
+
+// SettingWindowContext carries both the target settings page and the opener source.
+// The source is explicit because native visibility is not a reliable proxy for
+// whether settings came from the launcher or from the tray/menu-bar entry.
 type SettingWindowContext struct {
-	Path  string
-	Param string
+	Path   string
+	Param  string
+	Source SettingWindowSource
 }
 
 func (c PlainQuery) IsEmpty() bool {

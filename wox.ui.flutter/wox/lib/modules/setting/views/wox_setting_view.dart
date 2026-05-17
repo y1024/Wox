@@ -187,7 +187,14 @@ class _WoxSettingViewState extends State<WoxSettingView> {
         autofocus: true,
         onKeyEvent: (FocusNode node, KeyEvent event) {
           Logger.instance.debug(const UuidV4().generate(), "[KEYLOG][FLUTTER-SETTING] WoxPlatformFocus received key event: ${event.logicalKey.keyLabel}");
-          if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+          if (event.logicalKey == LogicalKeyboardKey.escape && (event is KeyDownEvent || event is KeyRepeatEvent)) {
+            // Bug fix: Escape can arrive as a down/repeat/up sequence. The old
+            // KeyDown handler exited settings immediately, so holding Escape could
+            // also leak follow-up events into the launcher or hide path. Consume
+            // the press here and perform the route transition on KeyUp only.
+            return KeyEventResult.handled;
+          }
+          if (event is KeyUpEvent && event.logicalKey == LogicalKeyboardKey.escape) {
             final traceId = const UuidV4().generate();
             Logger.instance.info(traceId, "[KEYLOG][FLUTTER-SETTING] ESC key pressed, hiding window");
             controller.hideWindow(traceId);

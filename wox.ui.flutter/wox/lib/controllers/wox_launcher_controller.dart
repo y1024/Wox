@@ -1664,6 +1664,16 @@ class WoxLauncherController extends GetxController {
       isInOnboardingView.value = false;
       await WoxApi.instance.onOnboarding(traceId, false);
     }
+    if (isInSettingView.value) {
+      // Bug fix: the native window can become hidden while the settings route is
+      // still mounted, for example after a management-view blur or a platform
+      // hide outside hideApp(). A later launcher show must clear that stale route;
+      // otherwise the window reopens as settings instead of the query UI.
+      isSettingOpenedFromHidden = false;
+      isInSettingView.value = false;
+      Get.find<WoxSettingController>().settingFocusNode.unfocus();
+      await WoxApi.instance.onSetting(traceId, false);
+    }
 
     // update some properties to latest for later use
     latestQueryHistories.assignAll(params.queryHistories);
@@ -3475,9 +3485,11 @@ class WoxLauncherController extends GetxController {
       positionBeforeOpenSetting = await windowManager.getPosition();
     } catch (_) {}
 
-    // Mark whether settings opened while window is hidden (e.g., from tray)
-    var isVisible = await windowManager.isVisible();
-    isSettingOpenedFromHidden = !isVisible;
+    // Bug fix: settings exit behavior follows the opener source instead of
+    // current visibility. Launcher-origin opens can temporarily lose native
+    // visibility, while tray-origin opens must still close directly back to
+    // hidden state.
+    isSettingOpenedFromHidden = context.source == SettingWindowContext.sourceTray;
     isInSettingView.value = true;
     isInOnboardingView.value = false;
     await WoxApi.instance.onSetting(traceId, true);
@@ -3516,13 +3528,14 @@ class WoxLauncherController extends GetxController {
       });
     }
 
-    await windowManager.setSize(const Size(1200, 800));
+    const settingWindowSize = Size(1200, 800);
+    await windowManager.setSize(settingWindowSize);
     if (Platform.isLinux) {
       // On Linux we need to show first before positioning works reliably
       await windowManager.show();
-      await windowManager.center(1200, 800);
+      await windowManager.center(settingWindowSize.width, settingWindowSize.height);
     } else {
-      await windowManager.center(1200, 800);
+      await windowManager.center(settingWindowSize.width, settingWindowSize.height);
       await windowManager.show();
     }
     await windowManager.focus();

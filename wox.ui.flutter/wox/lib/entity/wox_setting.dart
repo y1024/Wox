@@ -369,14 +369,23 @@ class TrayQuery {
 }
 
 class SettingWindowContext {
+  // Bug fix: keep tray-opened settings distinguishable from launcher-opened
+  // settings after the JSON bridge. Visibility can change during the transition,
+  // so the opener source is the stable signal for Escape exit behavior.
+  static const String sourceTray = 'tray';
+
   late String path;
   late String param;
+  // Source is optional for compatibility with older core messages; empty/default
+  // means the settings page should return to the launcher query UI.
+  late String source;
 
-  SettingWindowContext({required this.path, required this.param});
+  SettingWindowContext({required this.path, required this.param, this.source = ''});
 
   SettingWindowContext.fromJson(Map<String, dynamic> json) {
     path = json['Path'];
     param = json['Param'];
+    source = json['Source'] ?? '';
   }
 }
 

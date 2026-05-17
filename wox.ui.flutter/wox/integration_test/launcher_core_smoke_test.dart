@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:convert';
 import 'dart:ui' as ui;
 
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:uuid/v4.dart';
@@ -9,6 +10,7 @@ import 'package:wox/entity/wox_image.dart';
 import 'package:wox/entity/wox_preview.dart';
 import 'package:wox/entity/wox_preview_list.dart';
 import 'package:wox/entity/wox_query.dart';
+import 'package:wox/entity/wox_setting.dart';
 import 'package:wox/enums/wox_image_type_enum.dart';
 import 'package:wox/enums/wox_launch_mode_enum.dart';
 import 'package:wox/enums/wox_position_type_enum.dart';
@@ -129,6 +131,63 @@ void registerLauncherCoreSmokeTests() {
       expect(await windowManager.isVisible(), isTrue);
       expect(controller.isInSettingView.value, isFalse);
       expect(controller.queryBoxFocusNode.hasFocus, isTrue);
+    });
+
+    testWidgets('T2-06a: Holding Escape in settings returns to query box without hiding launcher', (tester) async {
+      final controller = await launchAndShowLauncher(tester, windowSize: smokeLargeWindowSize);
+      await openSettings(tester, controller, 'general');
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.escape);
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(await windowManager.isVisible(), isTrue);
+      expect(controller.isInSettingView.value, isTrue);
+      expect(find.byType(WoxSettingView), findsOneWidget);
+
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.escape);
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(await windowManager.isVisible(), isTrue);
+      expect(controller.isInSettingView.value, isTrue);
+      expect(find.byType(WoxSettingView), findsOneWidget);
+
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.escape);
+      await waitForQueryBoxFocus(tester, controller);
+
+      expect(await windowManager.isVisible(), isTrue);
+      expect(controller.isInSettingView.value, isFalse);
+      expect(controller.queryBoxFocusNode.hasFocus, isTrue);
+      expect(find.byType(WoxLauncherView), findsOneWidget);
+    });
+
+    testWidgets('T2-06b: Re-show after a hidden settings route opens the launcher query UI', (tester) async {
+      final controller = await launchAndShowLauncher(tester, windowSize: smokeLargeWindowSize);
+      await openSettings(tester, controller, 'general');
+
+      await windowManager.hide();
+      await waitForWindowVisibility(tester, false);
+      expect(controller.isInSettingView.value, isTrue);
+
+      await triggerBackendShowApp(tester);
+      await waitForQueryBoxFocus(tester, controller);
+
+      expect(await windowManager.isVisible(), isTrue);
+      expect(controller.isInSettingView.value, isFalse);
+      expect(controller.queryBoxFocusNode.hasFocus, isTrue);
+      expect(find.byType(WoxLauncherView), findsOneWidget);
+    });
+
+    testWidgets('T2-06c: Tray-opened settings closes back to hidden state on Escape', (tester) async {
+      final controller = await launchLauncherApp(tester);
+      await triggerTestOpenSetting(tester, source: SettingWindowContext.sourceTray);
+      await pumpUntil(tester, () => controller.isInSettingView.value && find.byType(WoxSettingView).evaluate().isNotEmpty, timeout: const Duration(seconds: 30));
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.escape);
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.escape);
+
+      await waitForWindowVisibility(tester, false);
+      expect(controller.isInSettingView.value, isFalse);
     });
 
     testWidgets('T2-07: Re-show restores query box focus for immediate typing', (tester) async {

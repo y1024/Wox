@@ -709,7 +709,7 @@ func (m *Manager) ShowTray() {
 		}, tray.MenuItem{
 			Title: i18n.GetI18nManager().TranslateWox(ctx, "ui_tray_open_setting_window"),
 			Callback: func() {
-				m.GetUI(ctx).OpenSettingWindow(ctx, common.SettingWindowContext{})
+				m.GetUI(ctx).OpenSettingWindow(ctx, common.SettingWindowContext{Source: common.SettingWindowSourceTray})
 			},
 		}, tray.MenuItem{
 			Title: i18n.GetI18nManager().TranslateWox(ctx, "ui_tray_quit"),
@@ -813,8 +813,9 @@ func (m *Manager) refreshTrayQueryIcons(ctx context.Context) {
 			ContextMenuCallback: func() {
 				openSettingCtx := util.NewTraceContext()
 				m.GetUI(openSettingCtx).OpenSettingWindow(openSettingCtx, common.SettingWindowContext{
-					Path:  "/general",
-					Param: fmt.Sprintf("tray_queries:%d", trayQueryIndex),
+					Path:   "/general",
+					Param:  fmt.Sprintf("tray_queries:%d", trayQueryIndex),
+					Source: common.SettingWindowSourceTray,
 				})
 			},
 		})
